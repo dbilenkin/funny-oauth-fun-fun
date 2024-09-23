@@ -4,6 +4,12 @@ To run this locally:
 
 ## Testing the Application
 
+### Add .env file to Go Server with actual client id and secret
+```
+GOOGLE_CLIENT_ID=real client id goes here
+GOOGLE_CLIENT_SECRET=real client secret goes here
+```
+
 ### Start the Go Server
 `cd google-oauth-go`
 Copy code \
