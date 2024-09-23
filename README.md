@@ -1,6 +1,21 @@
-# React / Golang / Google OAuth Integration using JWTs created completely by ChatGPT-o1
+# React / Vite / Golang / Google OAuth Integration using JWTs created completely by ChatGPT o1-preview
 
-This is the text that ChatGPT created with the last prompt when I asked to add JWTs:
+To run this locally:
+
+## Testing the Application
+
+### Start the Go Server
+`cd google-oauth-go`
+Copy code \
+`go run main.go`
+
+### Start the React Application
+`cd google-oauth-react`
+Copy code \
+`npm run dev`
+
+
+# Text that ChatGPT created with the last prompt when I asked to add JWTs:
 
 
 ## **Table of Contents**
