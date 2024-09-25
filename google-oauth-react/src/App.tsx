@@ -1,5 +1,17 @@
+// src/App.tsx
+
 import React, { useEffect, useState } from 'react';
 import axios from 'axios';
+import {
+  BrowserRouter as Router,
+  Routes,
+  Route,
+} from 'react-router-dom';
+import Navbar from './components/Navbar';
+import ProtectedRoute from './components/ProtectedRoute';
+import Home from './pages/Home';
+import Users from './pages/Users';
+import Profile from './pages/Profile'; // Optional
 
 interface User {
   id?: string;
@@ -14,6 +26,8 @@ interface User {
 const App: React.FC = () => {
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
+
+  const API_BASE_URL = 'https://hzkn0o3ly4.execute-api.us-east-2.amazonaws.com/prod';
 
   useEffect(() => {
     // Check if token is in URL parameters
@@ -37,7 +51,7 @@ const App: React.FC = () => {
     if (token) {
       // Fetch user data from the backend
       axios
-        .get('http://localhost:8080/user', {
+        .get(`${API_BASE_URL}/user`, {
           headers: { Authorization: `Bearer ${token}` },
         })
         .then((response) => {
@@ -53,7 +67,7 @@ const App: React.FC = () => {
   }, [token]);
 
   const handleLogin = () => {
-    window.location.href = 'http://localhost:8080/login';
+    window.location.href = `${API_BASE_URL}/login`;
   };
 
   const handleLogout = () => {
@@ -63,18 +77,48 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="App">
-      <h1>React Google OAuth Example with JWT</h1>
-      {user ? (
-        <div>
-          <h2>Welcome, {user.name}!</h2>
-          {user.picture && <img src={user.picture} alt="Profile" />}
-          <p>Email: {user.email}</p>
-          <button onClick={handleLogout}>Logout</button>
+    <Router>
+      {/* Add 'dark' class to enable dark mode */}
+      <div className="flex flex-col min-h-screen bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+        <Navbar user={user} handleLogin={handleLogin} handleLogout={handleLogout} />
+        <div className="flex-grow container mx-auto px-4">
+          <Routes>
+            <Route path="/" element={<Home />} />
+            <Route
+              path="/users"
+              element={
+                <ProtectedRoute user={user}>
+                  <Users />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/profile"
+              element={
+                <ProtectedRoute user={user}>
+                  {/* Non-Null Assertion */}
+                  <Profile user={user!} />
+                </ProtectedRoute>
+              }
+            />
+            {/* Add more routes as needed */}
+            <Route path="*" element={<NotFound />} />
+          </Routes>
         </div>
-      ) : (
-        <button onClick={handleLogin}>Login with Google</button>
-      )}
+        <footer className="bg-gray-200 dark:bg-gray-800 text-center p-4">
+          &copy; {new Date().getFullYear()} OAuthApp. All rights reserved.
+        </footer>
+      </div>
+    </Router>
+  );
+};
+
+// Optional: NotFound Component
+const NotFound: React.FC = () => {
+  return (
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 dark:bg-gray-900">
+      <h1 className="text-4xl font-bold mb-4">404 - Not Found</h1>
+      <p className="text-lg text-gray-700 dark:text-gray-300">The page you are looking for does not exist.</p>
     </div>
   );
 };

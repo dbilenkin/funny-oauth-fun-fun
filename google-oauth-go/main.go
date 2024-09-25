@@ -3,15 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	"github.com/golang-jwt/jwt"
-	"github.com/gorilla/mux"
-	"github.com/joho/godotenv"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
@@ -27,21 +32,56 @@ type UserInfo struct {
 	Locale        string `json:"locale"`
 }
 
-var googleOauthConfig *oauth2.Config
+type User struct {
+	UserId    string    `dynamodbav:"UserId" json:"userId"`
+	Email     string    `dynamodbav:"Email" json:"email"`
+	Name      string    `dynamodbav:"Name" json:"name"`
+	CreatedAt time.Time `dynamodbav:"CreatedAt" json:"createdAt"`
+	// Add other fields as needed
+}
 
-// Secret key used to sign tokens (in production, store securely)
-var jwtKey = []byte("your_secret_key")
+type Claims struct {
+	User UserInfo `json:"user"`
+	jwt.StandardClaims
+}
 
-func main() {
-	// Load environment variables
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
+func authenticateRequest(request events.APIGatewayProxyRequest, jwtKey []byte) (*UserInfo, error) {
+	authHeader, ok := request.Headers["Authorization"]
+	if !ok {
+		return nil, errors.New("authorization header missing")
 	}
 
-	// Initialize OAuth2 config
+	parts := strings.Split(authHeader, " ")
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		return nil, errors.New("invalid authorization header format")
+	}
+
+	tokenString := parts[1]
+	if tokenString == "" {
+		return nil, errors.New("token missing")
+	}
+
+	claims := &Claims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
+	})
+
+	if err != nil || !token.Valid {
+		return nil, fmt.Errorf("invalid token: %v", err)
+	}
+
+	return &claims.User, nil
+}
+
+var googleOauthConfig *oauth2.Config
+var jwtKey = []byte(os.Getenv("JWT_KEY"))
+var allowedOrigin = os.Getenv("ALLOWED_ORIGIN")
+var db *dynamodb.DynamoDB
+var tableName string
+
+func init() {
 	googleOauthConfig = &oauth2.Config{
-		RedirectURL:  "http://localhost:8080/callback",
+		RedirectURL:  os.Getenv("REDIRECT_URL"),
 		ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
 		ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
 		Scopes: []string{
@@ -51,49 +91,90 @@ func main() {
 		Endpoint: google.Endpoint,
 	}
 
-	// Initialize router
-	r := mux.NewRouter()
-	r.HandleFunc("/login", loginHandler)
-	r.HandleFunc("/callback", callbackHandler)
-	r.Handle("/user", jwtMiddleware(userHandler)).Methods("GET")
-	r.HandleFunc("/logout", logoutHandler).Methods("POST")
-
-	// Handle CORS
-	handler := corsMiddleware(r)
-
-	fmt.Println("Server started at http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", handler))
+	sess := session.Must(session.NewSession(&aws.Config{
+		Region: aws.String("us-east-2"), // Replace with your region
+	}))
+	db = dynamodb.New(sess)
+	tableName = "funny-oauth-users"
 }
 
-func loginHandler(w http.ResponseWriter, r *http.Request) {
-	state := "randomstate" // Implement state verification for security
-	url := googleOauthConfig.AuthCodeURL(state)
-	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
-}
+func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	method := request.HTTPMethod
+	path := request.Path
 
-func callbackHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO: Verify state parameter for security
+	fmt.Printf("Method: %s, Path: %s\n", method, path)
 
-	code := r.URL.Query().Get("code")
-	token, err := googleOauthConfig.Exchange(context.Background(), code)
-	if err != nil {
-		http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
-		return
+	// Handle OPTIONS method for CORS preflight
+	if method == "OPTIONS" {
+		return events.APIGatewayProxyResponse{
+			StatusCode: http.StatusOK,
+			Headers:    getCORSHeaders(),
+			Body:       "",
+		}, nil
 	}
 
-	// Retrieve user info
+	// Routing logic based on path
+	switch path {
+	case "/login":
+		return loginHandler(request)
+	case "/callback":
+		return callbackHandler(request)
+	case "/user":
+		return userHandler(request)
+	case "/users":
+		return listUsersHandler(request)
+	default:
+		return events.APIGatewayProxyResponse{
+			StatusCode: http.StatusNotFound,
+			Headers:    getCORSHeaders(),
+			Body:       "Not Found",
+		}, nil
+	}
+}
+
+func loginHandler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	state := "randomstate" // Implement proper state management for security
+	url := googleOauthConfig.AuthCodeURL(state)
+
+	headers := getCORSHeaders()
+	headers["Location"] = url
+
+	return events.APIGatewayProxyResponse{
+		StatusCode: http.StatusFound,
+		Headers:    headers,
+		Body:       "",
+	}, nil
+}
+
+func callbackHandler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	code := request.QueryStringParameters["code"]
+	if code == "" {
+		return errorResponse("Code not found in query parameters", http.StatusBadRequest)
+	}
+
+	token, err := googleOauthConfig.Exchange(context.Background(), code)
+	if err != nil {
+		fmt.Println("Error exchanging token:", err)
+		return errorResponse("Failed to exchange token", http.StatusInternalServerError)
+	}
+
 	client := googleOauthConfig.Client(context.Background(), token)
 	resp, err := client.Get("https://www.googleapis.com/oauth2/v2/userinfo")
 	if err != nil {
-		http.Error(w, "Failed to get user info: "+err.Error(), http.StatusInternalServerError)
-		return
+		fmt.Println("Error getting user info:", err)
+		return errorResponse("Failed to get user info", http.StatusInternalServerError)
 	}
 	defer resp.Body.Close()
 
 	var userInfo UserInfo
 	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
-		http.Error(w, "Failed to decode user info: "+err.Error(), http.StatusInternalServerError)
-		return
+		fmt.Println("Error decoding user info:", err)
+		return errorResponse("Failed to decode user info", http.StatusInternalServerError)
+	}
+
+	// Save user to DynamoDB
+	if err := saveUser(userInfo); err != nil {
+		return errorResponse("Failed to save user data", http.StatusInternalServerError)
 	}
 
 	// Generate JWT
@@ -106,91 +187,174 @@ func callbackHandler(w http.ResponseWriter, r *http.Request) {
 	tokenJWT := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := tokenJWT.SignedString(jwtKey)
 	if err != nil {
-		http.Error(w, "Failed to generate token: "+err.Error(), http.StatusInternalServerError)
-		return
+		fmt.Println("Error generating JWT:", err)
+		return errorResponse("Failed to generate token", http.StatusInternalServerError)
 	}
 
-	// Return the token to the client
-	http.Redirect(w, r, "http://localhost:5173/?token="+tokenString, http.StatusTemporaryRedirect)
+	// Redirect back to the React app with the token
+	redirectURL := os.Getenv("FRONTEND_URL") + "?token=" + tokenString
+
+	headers := getCORSHeaders()
+	headers["Location"] = redirectURL
+
+	return events.APIGatewayProxyResponse{
+		StatusCode: http.StatusFound,
+		Headers:    headers,
+		Body:       "",
+	}, nil
 }
 
-func userHandler(w http.ResponseWriter, r *http.Request) {
-	// Retrieve the user info from the context
-	userInfo := r.Context().Value("userInfo").(UserInfo)
+func saveUser(userInfo UserInfo) error {
 
-	// Return the user info as JSON
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(userInfo)
+	fmt.Println("userInfo: ", userInfo)
+	fmt.Println("userInfo.ID: ", userInfo.ID)
+	user := User{
+		UserId:    userInfo.ID,
+		Email:     userInfo.Email,
+		Name:      userInfo.Name,
+		CreatedAt: time.Now(),
+		// Populate other fields if necessary
+	}
+
+	av, err := dynamodbattribute.MarshalMap(user)
+	if err != nil {
+		fmt.Println("Failed to marshal user data:", err)
+		return err
+	}
+
+	// Log the marshalled item
+	marshalledItem, _ := json.MarshalIndent(av, "", "  ")
+	fmt.Println("Marshalled Item:", string(marshalledItem))
+
+	input := &dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item:      av,
+		// Optionally, you can use a condition expression to prevent overwriting existing items
+		// ConditionExpression: aws.String("attribute_not_exists(UserID)"),
+	}
+
+	_, err = db.PutItem(input)
+	if err != nil {
+		fmt.Println("Failed to put item into DynamoDB:", err)
+		return err
+	}
+
+	return nil
 }
 
-func logoutHandler(w http.ResponseWriter, r *http.Request) {
-	// Client-side logout by removing the token
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Logged out"))
+func listUsersHandler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	_, err := authenticateRequest(request, jwtKey)
+	if err != nil {
+		return errorResponse(err.Error(), http.StatusUnauthorized)
+	}
+
+	// Optionally, restrict access based on userInfo
+	// e.g., check if user has admin privileges
+
+	input := &dynamodb.ScanInput{
+		TableName: aws.String(tableName),
+	}
+
+	result, err := db.Scan(input)
+	if err != nil {
+		fmt.Println("Failed to scan DynamoDB:", err)
+		return errorResponse("Failed to retrieve users", http.StatusInternalServerError)
+	}
+
+	var users []User
+	err = dynamodbattribute.UnmarshalListOfMaps(result.Items, &users)
+	if err != nil {
+		fmt.Println("Failed to unmarshal users:", err)
+		return errorResponse("Failed to process user data", http.StatusInternalServerError)
+	}
+
+	responseBody, err := json.Marshal(users)
+	if err != nil {
+		return errorResponse("Failed to marshal users", http.StatusInternalServerError)
+	}
+
+	headers := getCORSHeaders()
+	headers["Content-Type"] = "application/json"
+
+	return events.APIGatewayProxyResponse{
+		StatusCode: http.StatusOK,
+		Headers:    headers,
+		Body:       string(responseBody),
+	}, nil
 }
 
-// Middleware to verify JWT
-func jwtMiddleware(next http.HandlerFunc) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			http.Error(w, "Authorization header missing", http.StatusUnauthorized)
-			return
-		}
+func userHandler(request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	authHeader := request.Headers["Authorization"]
+	if authHeader == "" {
+		return errorResponse("Authorization header missing", http.StatusUnauthorized)
+	}
 
-		// Expected format: "Bearer <token>"
-		tokenString := ""
-		fmt.Sscanf(authHeader, "Bearer %s", &tokenString)
+	// Extract token from the header
+	var tokenString string
+	if _, err := fmt.Sscanf(authHeader, "Bearer %s", &tokenString); err != nil {
+		return errorResponse("Invalid authorization header format", http.StatusUnauthorized)
+	}
 
-		if tokenString == "" {
-			http.Error(w, "Token missing", http.StatusUnauthorized)
-			return
-		}
+	if tokenString == "" {
+		return errorResponse("Token missing", http.StatusUnauthorized)
+	}
 
-		// Parse and verify token
-		claims := &jwt.MapClaims{}
-		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method")
-			}
-			return jwtKey, nil
-		})
-		if err != nil || !token.Valid {
-			http.Error(w, "Invalid token: "+err.Error(), http.StatusUnauthorized)
-			return
-		}
-
-		// Extract user info from claims
-		userMap := (*claims)["user"].(map[string]interface{})
-		userInfo := UserInfo{
-			ID:            userMap["id"].(string),
-			Email:         userMap["email"].(string),
-			VerifiedEmail: userMap["verified_email"].(bool),
-			Name:          userMap["name"].(string),
-			GivenName:     userMap["given_name"].(string),
-			FamilyName:    userMap["family_name"].(string),
-			Picture:       userMap["picture"].(string),
-			Locale:        userMap["locale"].(string),
-		}
-
-		// Add user info to request context
-		ctx := context.WithValue(r.Context(), "userInfo", userInfo)
-		next.ServeHTTP(w, r.WithContext(ctx))
+	// Parse and validate the JWT token
+	claims := &jwt.MapClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		return jwtKey, nil
 	})
+
+	if err != nil || !token.Valid {
+		return errorResponse("Invalid token: "+err.Error(), http.StatusUnauthorized)
+	}
+
+	// Extract user info from claims
+	userMap := (*claims)["user"].(map[string]interface{})
+	userInfo := UserInfo{
+		ID:            userMap["id"].(string),
+		Email:         userMap["email"].(string),
+		VerifiedEmail: userMap["verified_email"].(bool),
+		Name:          userMap["name"].(string),
+		GivenName:     userMap["given_name"].(string),
+		FamilyName:    userMap["family_name"].(string),
+		Picture:       userMap["picture"].(string),
+		Locale:        userMap["locale"].(string),
+	}
+
+	responseBody, err := json.Marshal(userInfo)
+	if err != nil {
+		return errorResponse("Failed to marshal user info", http.StatusInternalServerError)
+	}
+
+	headers := getCORSHeaders()
+	headers["Content-Type"] = "application/json"
+
+	return events.APIGatewayProxyResponse{
+		StatusCode: http.StatusOK,
+		Headers:    headers,
+		Body:       string(responseBody),
+	}, nil
 }
 
-// CORS middleware remains the same
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+func errorResponse(message string, statusCode int) (events.APIGatewayProxyResponse, error) {
+	headers := getCORSHeaders()
+	return events.APIGatewayProxyResponse{
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       message,
+	}, nil
+}
 
-		if r.Method == "OPTIONS" {
-			return
-		}
+func getCORSHeaders() map[string]string {
+	return map[string]string{
+		"Access-Control-Allow-Origin":      allowedOrigin,
+		"Access-Control-Allow-Methods":     "GET, POST, OPTIONS",
+		"Access-Control-Allow-Headers":     "Content-Type, Authorization",
+		"Access-Control-Allow-Credentials": "true",
+	}
+}
 
-		next.ServeHTTP(w, r)
-	})
+func main() {
+	lambda.Start(handler)
 }
